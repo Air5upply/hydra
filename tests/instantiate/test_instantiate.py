@@ -24,6 +24,7 @@ from hydra._internal.instantiate._instantiate2 import _resolve_target
 from hydra.errors import InstantiationException
 from hydra.test_utils.test_utils import assert_multiline_regex_search
 from hydra.types import ConvertMode, TargetConf
+from hydra.utils import UNSAFE_ALLOW_ALL_TARGETS, target_whitelist
 from tests.instantiate import (
     AClass,
     Adam,
@@ -35,6 +36,7 @@ from tests.instantiate import (
     BClass,
     CenterCrop,
     CenterCropConf,
+    CallableClass,
     Compose,
     ComposeConf,
     IllegalType,
@@ -75,7 +77,16 @@ from tests.instantiate import (
     ],
 )
 def instantiate_func(request: Any) -> Any:
-    return request.param
+    def wrapper(config: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("_target_whitelist_", UNSAFE_ALLOW_ALL_TARGETS)
+        return request.param(config, *args, **kwargs)
+
+    return wrapper
+
+
+@fixture
+def legacy_instantiate_func() -> Any:
+    return hydra._internal.instantiate._instantiate2.instantiate
 
 
 @fixture(
@@ -1629,7 +1640,7 @@ def test_cannot_locate_target(instantiate_func: Any) -> None:
         "subprocess.run",
     ],
 )
-def test_blocklisted_target_fails(instantiate_func: Any, target: str) -> None:
+def test_blocklisted_target_fails(legacy_instantiate_func: Any, target: str) -> None:
     cfg = OmegaConf.create({"foo": {"_target_": target}})
     with raises(
         InstantiationException,
@@ -1639,14 +1650,14 @@ def test_blocklisted_target_fails(instantiate_func: Any, target: str) -> None:
                 HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE={target}:<other allowlisted targets> to bypass
                 full_key: foo""")),
     ) as exc_info:
-        instantiate_func(cfg)
+        legacy_instantiate_func(cfg)
     err = exc_info.value
     assert hasattr(err, "__cause__")
     chained = err.__cause__
     assert chained is None
 
 
-def test_allowlist_works(instantiate_func: Any, monkeypatch: Any) -> None:
+def test_allowlist_works(legacy_instantiate_func: Any, monkeypatch: Any) -> None:
     cfg = OmegaConf.create(
         {
             "foo": {"_target_": "builtins.exec", "_args_": ["5+8"]},
@@ -1656,19 +1667,257 @@ def test_allowlist_works(instantiate_func: Any, monkeypatch: Any) -> None:
     monkeypatch.setenv(
         "HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE", "builtins.exec:builtins.eval"
     )
-    res = instantiate_func(cfg)
+    with warns(UserWarning, match="_target_whitelist_"):
+        res = legacy_instantiate_func(cfg)
     assert res.foo is None
     assert res.bar == 3
 
 
 def test_allowlist_works_for_prefix_blocked_target(monkeypatch: Any) -> None:
     monkeypatch.setenv("HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE", "os.execl")
-    assert _resolve_target("os.execl", "") is os.execl
+    with warns(UserWarning, match="_target_whitelist_"):
+        assert _resolve_target("os.execl", "") is os.execl
+
+
+def test_target_whitelist_warns_in_legacy_mode(legacy_instantiate_func: Any) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10, "b": 20, "c": 30}
+    with warns(UserWarning, match="_target_whitelist_"):
+        assert legacy_instantiate_func(cfg) == AClass(a=10, b=20, c=30)
+
+
+def test_target_whitelist_warning_points_to_user_callsite(
+    legacy_instantiate_func: Any,
+) -> None:
+    cfg = {
+        "nested": {
+            "_target_": "tests.instantiate.AClass",
+            "a": 10,
+            "b": 20,
+            "c": 30,
+        }
+    }
+    with warns(UserWarning, match="_target_whitelist_") as records:
+        assert legacy_instantiate_func(cfg) == {
+            "nested": AClass(a=10, b=20, c=30)
+        }
+
+    assert os.path.samefile(records[0].filename, __file__)
+
+
+def test_target_whitelist_applies_to_callable_targets(
+    legacy_instantiate_func: Any,
+) -> None:
+    cfg = {"_target_": AClass, "a": 10, "b": 20, "c": 30}
+    with warns(UserWarning, match="_target_whitelist_"):
+        assert legacy_instantiate_func(cfg) == AClass(a=10, b=20, c=30)
+
+    assert legacy_instantiate_func(
+        cfg, _target_whitelist_="tests.instantiate.AClass"
+    ) == AClass(a=10, b=20, c=30)
+
+    cfg = OmegaConf.create(
+        {"_target_": module_function, "x": 10},
+        flags={"allow_objects": True},
+    )
+    with warns(UserWarning, match="_target_whitelist_"):
+        assert legacy_instantiate_func(cfg) == 10
+
+    with raises(
+        InstantiationException,
+        match=(
+            "Target 'tests.instantiate.module_function' is not in the "
+            "instantiate target whitelist"
+        ),
+    ):
+        legacy_instantiate_func(cfg, _target_whitelist_=[])
+
+    assert (
+        legacy_instantiate_func(
+            cfg, _target_whitelist_="tests.instantiate.module_function"
+        )
+        == 10
+    )
+
+    cfg = OmegaConf.create(
+        {"_target_": eval, "_args_": ["1+2"]},
+        flags={"allow_objects": True},
+    )
+    with raises(
+        InstantiationException,
+        match="Target 'builtins.eval' is blocklisted",
+    ):
+        legacy_instantiate_func(cfg)
+
+    target = CallableClass()
+    cfg = OmegaConf.create(
+        {"_target_": target},
+        flags={"allow_objects": True},
+    )
+    assert (
+        legacy_instantiate_func(
+            cfg, _target_whitelist_="tests.instantiate.CallableClass"
+        )
+        == "callable class"
+    )
+
+    cfg = {"_target_": target}
+    assert (
+        legacy_instantiate_func(
+            cfg, _target_whitelist_="tests.instantiate.CallableClass"
+        )
+        == "callable class"
+    )
+
+
+@mark.parametrize(
+    "target_whitelist",
+    [
+        "tests.instantiate.*",
+        ["tests.instantiate.AClass"],
+    ],
+)
+def test_target_whitelist_allows_expected_targets(
+    instantiate_func: Any, target_whitelist: Any
+) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10, "b": 20, "c": 30}
+    assert instantiate_func(cfg, _target_whitelist_=target_whitelist) == AClass(
+        a=10, b=20, c=30
+    )
+
+
+def test_target_whitelist_context_allows_expected_targets(
+    legacy_instantiate_func: Any,
+) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10, "b": 20, "c": 30}
+    with target_whitelist("tests.instantiate.*"):
+        assert legacy_instantiate_func(cfg) == AClass(a=10, b=20, c=30)
+
+
+def test_target_whitelist_context_stacks_additively(
+    legacy_instantiate_func: Any,
+) -> None:
+    class_cfg = {
+        "_target_": "tests.instantiate.AClass",
+        "a": 10,
+        "b": 20,
+        "c": 30,
+    }
+    function_cfg = {"_target_": "tests.instantiate.module_function", "x": 10}
+
+    with target_whitelist("tests.instantiate.AClass"):
+        assert legacy_instantiate_func(class_cfg) == AClass(a=10, b=20, c=30)
+        with target_whitelist("tests.instantiate.module_function"):
+            assert legacy_instantiate_func(class_cfg) == AClass(a=10, b=20, c=30)
+            assert legacy_instantiate_func(function_cfg) == 10
+
+        with raises(
+            InstantiationException,
+            match="Target 'tests.instantiate.module_function' is not in the instantiate target whitelist",
+        ):
+            legacy_instantiate_func(function_cfg)
+
+
+def test_target_whitelist_context_reset_replaces_outer_context(
+    legacy_instantiate_func: Any,
+) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10, "b": 20, "c": 30}
+
+    with target_whitelist("tests.instantiate.*"):
+        with target_whitelist([], reset=True):
+            with raises(
+                InstantiationException,
+                match="Target 'tests.instantiate.AClass' is not in the instantiate target whitelist",
+            ):
+                legacy_instantiate_func(cfg)
+
+        assert legacy_instantiate_func(cfg) == AClass(a=10, b=20, c=30)
+
+
+def test_target_whitelist_policy_can_be_passed_to_instantiate(
+    instantiate_func: Any,
+) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10, "b": 20, "c": 30}
+    policy = target_whitelist("tests.instantiate.*", reset=True)
+    assert instantiate_func(cfg, _target_whitelist_=policy) == AClass(
+        a=10, b=20, c=30
+    )
+
+
+def test_target_whitelist_policy_reset_replaces_context_for_instantiate(
+    legacy_instantiate_func: Any,
+) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10, "b": 20, "c": 30}
+
+    with target_whitelist("tests.instantiate.*"):
+        with raises(
+            InstantiationException,
+            match="Target 'tests.instantiate.AClass' is not in the instantiate target whitelist",
+        ):
+            legacy_instantiate_func(
+                cfg, _target_whitelist_=target_whitelist([], reset=True)
+            )
+
+
+@mark.parametrize(
+    "target_whitelist",
+    [
+        [],
+        "tests.other.*",
+        ["tests.instantiate.BClass"],
+    ],
+)
+def test_target_whitelist_blocks_unlisted_targets(
+    instantiate_func: Any, target_whitelist: Any
+) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10}
+    with raises(
+        InstantiationException,
+        match="Target 'tests.instantiate.AClass' is not in the instantiate target whitelist",
+    ):
+        instantiate_func(cfg, _target_whitelist_=target_whitelist)
+
+
+@mark.parametrize("target_whitelist", ["*", "*.*", "tests.*.AClass"])
+def test_target_whitelist_rejects_broad_wildcards(
+    instantiate_func: Any, target_whitelist: str
+) -> None:
+    cfg = {"_target_": "tests.instantiate.AClass", "a": 10}
+    with raises(
+        InstantiationException,
+        match="Invalid _target_whitelist_ entry",
+    ):
+        instantiate_func(cfg, _target_whitelist_=target_whitelist)
+
+
+def test_target_whitelist_in_config_is_rejected(instantiate_func: Any) -> None:
+    cfg = {
+        "_target_": "tests.instantiate.AClass",
+        "_target_whitelist_": "tests.instantiate.*",
+        "a": 10,
+    }
+    with raises(
+        InstantiationException,
+        match="_target_whitelist_ must be passed to instantiate\\(\\)",
+    ):
+        instantiate_func(cfg)
+
+
+def test_target_whitelist_can_explicitly_allow_blocklisted_targets(
+    instantiate_func: Any,
+) -> None:
+    cfg = {"_target_": "builtins.eval", "_args_": ["1+2"]}
+    assert instantiate_func(cfg, _target_whitelist_="builtins.eval") == 3
+
+
+def test_target_whitelist_unsafe_allows_all_targets(instantiate_func: Any) -> None:
+    cfg = {"_target_": "builtins.eval", "_args_": ["1+2"]}
+    assert instantiate_func(cfg, _target_whitelist_=UNSAFE_ALLOW_ALL_TARGETS) == 3
 
 
 def test_allowlist_works_for_canonical_os_alias(monkeypatch: Any) -> None:
     monkeypatch.setenv("HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE", "os.kill")
-    assert _resolve_target("posix.kill", "") is os.kill
+    with warns(UserWarning, match="no\n_target_whitelist_"):
+        assert _resolve_target("posix.kill", "") is os.kill
 
 
 @mark.parametrize(
